@@ -1,0 +1,6 @@
+{
+  "name": "QSI Engine",
+  "description": "Quranic Spectral Intelligence analytical framework and offline reasoning dashboard",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
