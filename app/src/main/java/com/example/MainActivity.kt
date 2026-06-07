@@ -761,6 +761,71 @@ fun QSIReasoningEngineScreen(viewModel: QSIViewModel) {
             LegendBadge("Transform 2 (x2)", CyanAccent)
             LegendBadge("Transform 3 (x3)", AmberAccent)
         }
+
+        if (chain.stepDetails.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(24.dp))
+            var showDetails by remember { mutableStateOf(false) }
+
+            Button(
+                onClick = { showDetails = !showDetails },
+                colors = ButtonDefaults.buttonColors(containerColor = ObsidianSurface),
+                border = BorderStroke(1.dp, ObsidianBorder),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        if (showDetails) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                        tint = EmeraldAccent
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        if (showDetails) "HIDE STEP-BY-STEP CALCULATIONS" else "SHOW FULL MATRIX CALCULATIONS",
+                        color = Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            AnimatedVisibility(visible = showDetails) {
+                Column(
+                    modifier = Modifier
+                        .padding(top = 12.dp)
+                        .background(Color.Black.copy(0.3f), RoundedCornerShape(12.dp))
+                        .border(1.dp, ObsidianBorder, RoundedCornerShape(12.dp))
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    chain.stepDetails.forEachIndexed { index, detail ->
+                        Column {
+                            Text(
+                                "STEP ${index + 1}",
+                                color = when (index) {
+                                    0 -> EmeraldAccent
+                                    1 -> CyanAccent
+                                    else -> AmberAccent
+                                },
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                detail,
+                                color = Color.LightGray,
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace,
+                                lineHeight = 16.sp
+                            )
+                        }
+                        if (index < chain.stepDetails.size - 1) {
+                            HorizontalDivider(color = ObsidianBorder, modifier = Modifier.padding(vertical = 8.dp))
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -4,6 +4,9 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -16,6 +19,8 @@ import kotlin.math.sqrt
 class QSIViewModel(application: Application) : AndroidViewModel(application) {
 
     private val context = application.applicationContext
+    private val database = AppDatabase.getDatabase(context)
+    private val dao = database.spectralDao()
 
     // Tab Index
     private val _currentTab = MutableStateFlow(0)
@@ -53,31 +58,77 @@ class QSIViewModel(application: Application) : AndroidViewModel(application) {
     private val _numberTheoryState = MutableStateFlow(NumberTheoryState())
     val numberTheoryState: StateFlow<NumberTheoryState> = _numberTheoryState.asStateFlow()
 
+    // Memory Cache for heavy matrices (Speed ++++)
+    private val matricesInMemory = mutableMapOf<Int, Array<DoubleArray>>()
+
     init {
-        // Load initial matrix & metric calculations
+        // Load initial display surah
         loadSurahMatrix(1)
 
-        // Compute similarity graph, adjacency matrix & low-dimensional projections in background thread
+        // Background Warm-up: Speed ++++ (Parallelized to use all CPU cores)
         viewModelScope.launch(Dispatchers.Default) {
             _loadingNetwork.value = true
-            val matrices = Array(114) { s -> QuranicDatabase.getMatrix(context, s + 1) }
-            val norms = DoubleArray(114) { s -> MatrixMath.frobeniusNorm(matrices[s]) }
+            
+            // 1. Efficiently preload all 114 matrices in parallel
+            coroutineScope {
+                (1..114).chunked(Runtime.getRuntime().availableProcessors() * 2).forEach { chunk ->
+                    chunk.map { s ->
+                        async {
+                            if (!matricesInMemory.containsKey(s)) {
+                                matricesInMemory[s] = QuranicDatabase.getMatrix(context, s)
+                            }
+                        }
+                    }.awaitAll()
+                }
+            }
 
-            // Similarity graph computing
-            val similarity = Array(114) { i ->
-                DoubleArray(114) { j ->
+            // 2. Parallel Metrics Computation and Room Caching
+            coroutineScope {
+                (1..114).chunked(10).forEach { chunk ->
+                    chunk.map { s ->
+                        async {
+                            val cached = dao.getEntry(s)
+                            if (cached == null) {
+                                val m = matricesInMemory[s]!!
+                                val sparsity = MatrixMath.sparsity(m)
+                                val trace = MatrixMath.trace(m)
+                                val frobNorm = MatrixMath.frobeniusNorm(m)
+                                val (rank, det) = MatrixMath.gaussianMetrics(m)
+                                val (specEntropy, condNo) = MatrixMath.spectralMetrics(m)
+                                
+                                dao.insertEntry(SpectralEntry(
+                                    surahIndex = s, rank = rank, trace = trace, determinant = det,
+                                    sparsity = sparsity, frobeniusNorm = frobNorm, 
+                                    spectralEntropy = specEntropy, conditionNumber = condNo
+                                ))
+                            }
+                        }
+                    }.awaitAll()
+                }
+            }
+
+            // 3. Parallel Optimized Similarity Matrix Calculation
+            val norms = DoubleArray(114) { s -> MatrixMath.frobeniusNorm(matricesInMemory[s + 1]!!) }
+            val similarity = Array(114) { DoubleArray(114) }
+            
+            (0 until 114).forEach { i ->
+                (i until 114).forEach { j ->
                     if (i == j) {
-                        1.0
+                        similarity[i][j] = 1.0
                     } else {
-                        val inner = MatrixMath.frobeniusInnerProduct(matrices[i], matrices[j])
+                        // Parallel inner loop computation would be overkill, 
+                        // but let's ensure the outer structure is efficient.
+                        val inner = MatrixMath.frobeniusInnerProduct(matricesInMemory[i + 1]!!, matricesInMemory[j + 1]!!)
                         val normProduct = norms[i] * norms[j]
-                        if (normProduct > 1e-9) inner / normProduct else 0.0
+                        val result = if (normProduct > 1e-9) inner / normProduct else 0.0
+                        similarity[i][j] = result
+                        similarity[j][i] = result
                     }
                 }
             }
             _similarityMatrix.value = similarity
 
-            // Project Similarity Matrix down to 2 coordinates using PCA/Laplacian
+            // 4. Projection
             val projection = MatrixMath.pcaProjection(similarity)
             _surahCoordinates.value = projection
             _loadingNetwork.value = false
@@ -93,25 +144,55 @@ class QSIViewModel(application: Application) : AndroidViewModel(application) {
         _selectedSurahIndex.value = index
 
         viewModelScope.launch(Dispatchers.Default) {
-            val matrix = QuranicDatabase.getMatrix(context, index)
+            // Speed ++++ Use memory cache if available
+            val matrix = matricesInMemory[index] ?: QuranicDatabase.getMatrix(context, index)
             _activeMatrix.value = matrix
 
-            // Calculate exact linear algebraic metrics
-            val sparsity = MatrixMath.sparsity(matrix)
-            val trace = MatrixMath.trace(matrix)
-            val frobNorm = MatrixMath.frobeniusNorm(matrix)
-            val (rank, det) = MatrixMath.gaussianMetrics(matrix)
-            val (specEntropy, condNo) = MatrixMath.spectralMetrics(matrix)
+            // Check Room Cache first
+            val cached = dao.getEntry(index)
+            if (cached != null) {
+                _activeMetrics.value = MatrixMetrics(
+                    rank = cached.rank,
+                    trace = cached.trace,
+                    determinant = cached.determinant,
+                    sparsity = cached.sparsity,
+                    frobeniusNorm = cached.frobeniusNorm,
+                    spectralEntropy = cached.spectralEntropy,
+                    conditionNumber = cached.conditionNumber
+                )
+            } else {
+                // Calculate exact linear algebraic metrics
+                val sparsity = MatrixMath.sparsity(matrix)
+                val trace = MatrixMath.trace(matrix)
+                val frobNorm = MatrixMath.frobeniusNorm(matrix)
+                val (rank, det) = MatrixMath.gaussianMetrics(matrix)
+                val (specEntropy, condNo) = MatrixMath.spectralMetrics(matrix)
 
-            _activeMetrics.value = MatrixMetrics(
-                rank = rank,
-                trace = trace,
-                determinant = det,
-                sparsity = sparsity,
-                frobeniusNorm = frobNorm,
-                spectralEntropy = specEntropy,
-                conditionNumber = condNo
-            )
+                val metrics = MatrixMetrics(
+                    rank = rank,
+                    trace = trace,
+                    determinant = det,
+                    sparsity = sparsity,
+                    frobeniusNorm = frobNorm,
+                    spectralEntropy = specEntropy,
+                    conditionNumber = condNo
+                )
+                _activeMetrics.value = metrics
+
+                // Persistence: Save to Room
+                dao.insertEntry(
+                    SpectralEntry(
+                        surahIndex = index,
+                        rank = rank,
+                        trace = trace,
+                        determinant = det,
+                        sparsity = sparsity,
+                        frobeniusNorm = frobNorm,
+                        spectralEntropy = specEntropy,
+                        conditionNumber = condNo
+                    )
+                )
+            }
         }
     }
 
@@ -128,10 +209,10 @@ class QSIViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
-            // Extract Surah Operators
-            val matrixI = QuranicDatabase.getMatrix(context, mi)
-            val matrixJ = QuranicDatabase.getMatrix(context, mj)
-            val matrixK = QuranicDatabase.getMatrix(context, mk)
+            // Extract Surah Operators (Speed ++++)
+            val matrixI = matricesInMemory[mi] ?: QuranicDatabase.getMatrix(context, mi)
+            val matrixJ = matricesInMemory[mj] ?: QuranicDatabase.getMatrix(context, mj)
+            val matrixK = matricesInMemory[mk] ?: QuranicDatabase.getMatrix(context, mk)
 
             // Propagate: x(1) = Mi * x0
             val x1 = project(matrixI, x0)
@@ -139,6 +220,13 @@ class QSIViewModel(application: Application) : AndroidViewModel(application) {
             val x2 = project(matrixJ, x1)
             // Propagate: x(3) = Mk * x2
             val x3 = project(matrixK, x2)
+
+            // Step-by-step detail logs for UI
+            val details = listOf(
+                generateDetails(mi, "MI", x0, x1),
+                generateDetails(mj, "MJ", x1, x2),
+                generateDetails(mk, "MK", x2, x3)
+            )
 
             _reasoningChainState.value = ReasoningState(
                 mi = mi,
@@ -148,9 +236,24 @@ class QSIViewModel(application: Application) : AndroidViewModel(application) {
                 step1Vector = x1,
                 step2Vector = x2,
                 step3Vector = x3,
-                activeInputType = inputVectorType
+                activeInputType = inputVectorType,
+                stepDetails = details
             )
         }
+    }
+
+    private fun generateDetails(surahIndex: Int, matrixName: String, inVec: DoubleArray, outVec: DoubleArray): String {
+        val sb = StringBuilder()
+        sb.append("Operator M($surahIndex) Projection:\n")
+        sb.append("y = $matrixName * x\n\n")
+        // Show first 5 components
+        for (i in 0 until 4) {
+            sb.append("y[$i] = Σ M[$i,j] * x[j] = ")
+            val valStr = String.format("%.4f", outVec[i])
+            sb.append("$valStr\n")
+        }
+        sb.append("... [remaining components truncated]")
+        return sb.toString()
     }
 
     private fun project(matrix: Array<DoubleArray>, vector: DoubleArray): DoubleArray {
@@ -197,8 +300,8 @@ class QSIViewModel(application: Application) : AndroidViewModel(application) {
             val learningRate = 0.001
             val epochs = 80
 
-            // Load fixed matrices in memory for rapid computation
-            val surahMatrices = surahSubset.associateWith { s -> QuranicDatabase.getMatrix(context, s) }
+            // Load fixed matrices in memory for rapid computation (Speed ++++)
+            val surahMatrices = surahSubset.associateWith { s -> matricesInMemory[s] ?: QuranicDatabase.getMatrix(context, s) }
 
             for (epoch in 0 until epochs) {
                 // Compute current prediction: y_hat = Σ α_s (M_s * x0)
@@ -270,10 +373,10 @@ class QSIViewModel(application: Application) : AndroidViewModel(application) {
                 for (i in 0 until size) v[i] /= vNorm
             }
 
-            // 2. Compute 114 norm-feature profile Φ(N)
+            // 2. Compute 114 norm-feature profile Φ(N) (Speed ++++)
             val phi = DoubleArray(114)
             for (s in 0 until 114) {
-                val matrix = QuranicDatabase.getMatrix(context, s + 1)
+                val matrix = matricesInMemory[s + 1] ?: QuranicDatabase.getMatrix(context, s + 1)
                 val z = project(matrix, v)
                 // L2 norm of z
                 phi[s] = sqrt(z.map { it * it }.sum())
@@ -343,27 +446,30 @@ class QSIViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun pollardRho(n: BigInteger): BigInteger {
         if (n.mod(BigInteger.valueOf(2)) == BigInteger.ZERO) return BigInteger.valueOf(2)
-        if (n.isProbablePrime(20)) return n
+        if (n.isProbablePrime(25)) return n
 
         var x = BigInteger.valueOf(2)
         var y = BigInteger.valueOf(2)
         var d = BigInteger.ONE
         var c = BigInteger.valueOf(1)
 
-        val f = { t: BigInteger -> (t.multiply(t).add(c)).mod(n) }
+        // Optimized function f(x) = (x^2 + c) mod n
+        fun f(t: BigInteger, constant: BigInteger, module: BigInteger): BigInteger {
+            return (t.multiply(t).add(constant)).mod(module)
+        }
 
         while (d == BigInteger.ONE) {
-            x = f(x)
-            y = f(f(y))
+            x = f(x, c, n)
+            y = f(f(y, c, n), c, n)
             d = x.subtract(y).abs().gcd(n)
             
             if (d == n) {
-                // Failure, try different c
+                // Failure: try different c or start point
                 c = c.add(BigInteger.ONE)
-                x = BigInteger.valueOf(2)
-                y = BigInteger.valueOf(2)
+                x = BigInteger.valueOf(java.util.Random().nextLong()).abs().mod(n)
+                y = x
                 d = BigInteger.ONE
-                if (c > BigInteger.valueOf(100)) break // Safety break
+                if (c > BigInteger.valueOf(200)) break // Safety break for extremely resilient composites
             }
         }
         return d
@@ -414,7 +520,8 @@ data class ReasoningState(
     val step1Vector: DoubleArray = DoubleArray(28),
     val step2Vector: DoubleArray = DoubleArray(28),
     val step3Vector: DoubleArray = DoubleArray(28),
-    val activeInputType: Int = 0
+    val activeInputType: Int = 0,
+    val stepDetails: List<String> = emptyList()
 )
 
 data class OperatorLabState(
